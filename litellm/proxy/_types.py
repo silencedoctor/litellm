@@ -12,6 +12,7 @@ from pydantic import (
     ConfigDict,
     Field,
     Json,
+    JsonValue,
     PositiveInt,
     field_validator,
     model_validator,
@@ -2622,6 +2623,10 @@ class ConfigGeneralSettings(LiteLLMPydanticObjectBase):
     infer_model_from_keys: bool | None = Field(
         None,
         description="for `/models` endpoint, infers available model based on environment keys (e.g. OPENAI_API_KEY)",
+    )
+    advertised_models: tuple[Mapping[str, JsonValue], ...] | None = Field(
+        None,
+        description="Additional catalog-only models returned by `/v1/models`. These are not registered with the LiteLLM router.",
     )
     background_health_checks: bool | None = Field(None, description="run health checks in background")
     health_check_interval: int = Field(300, description="background health check interval in seconds")

@@ -1,12 +1,13 @@
 """Response types for the model listing/retrieve endpoints (/v1/models, /models)."""
 
-from typing import Literal
+from collections.abc import Mapping
+from typing import Literal, TypeAlias
 
+from pydantic import JsonValue
 from typing_extensions import NotRequired, TypedDict
 
 
-class ModelInfoMetadata(TypedDict):
-    fallbacks: list[str]
+ModelInfoMetadata: TypeAlias = Mapping[str, JsonValue]
 
 
 class ModelInfoResponse(TypedDict):

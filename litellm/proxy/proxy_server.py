@@ -135,6 +135,7 @@ from litellm.router_utils.auto_router_tuning_baseline import (
     tuning_limit_violation,
 )
 from litellm.types.caching import RedisPipelineIncrementOperation
+from litellm.types.proxy.model_listing import ModelInfoResponse
 from litellm.types.utils import (
     ModelResponse,
     ModelResponseStream,
@@ -10406,6 +10407,52 @@ class ProxyStartupEvent:
             )
 
 
+def _append_advertised_models_to_model_data(
+    model_data: Sequence[ModelInfoResponse],
+    general_settings: Mapping[str, object],
+) -> tuple[ModelInfoResponse, ...]:
+    raw_advertised_models: Final[object] = general_settings.get("advertised_models")
+    from litellm.proxy.utils import create_model_info_response
+
+    advertised_models_adapter: Final = TypeAdapter(tuple[Mapping[str, JsonValue], ...])
+    metadata_adapter: Final = TypeAdapter(Mapping[str, JsonValue])
+    try:
+        advertised_rows: Final = advertised_models_adapter.validate_python(raw_advertised_models)
+    except ValidationError:
+        return tuple(model_data)
+
+    existing_ids: Final = frozenset(model["id"] for model in model_data)
+
+    def build_advertised_model(advertised_model: Mapping[str, JsonValue]) -> ModelInfoResponse | None:
+        raw_model_id: Final = advertised_model.get("id")
+        if not isinstance(raw_model_id, str):
+            return None
+        model_id: Final = raw_model_id.strip()
+        if not model_id or model_id in existing_ids:
+            return None
+
+        owned_by: Final = advertised_model.get("owned_by")
+        provider: Final = owned_by.strip() if isinstance(owned_by, str) and owned_by.strip() else "openai"
+        model_info: Final = create_model_info_response(
+            model_id=model_id,
+            provider=provider,
+        )
+        try:
+            metadata: Final = metadata_adapter.validate_python(advertised_model.get("metadata"))
+        except ValidationError:
+            return model_info
+        return {**model_info, "metadata": metadata}
+
+    additional_models: Final[Mapping[str, ModelInfoResponse]] = MappingProxyType(
+        {
+            model_info["id"]: model_info
+            for advertised_model in advertised_rows
+            if (model_info := build_advertised_model(advertised_model)) is not None
+        }
+    )
+    return (*model_data, *additional_models.values())
+
+
 #### API ENDPOINTS ####
 @router.get("/v1/models", dependencies=[Depends(user_api_key_auth)], tags=["model management"])
 @router.get(
@@ -10537,28 +10584,37 @@ async def model_list(
         # Surface the public team name by default; legacy internal keys via flag.
         # The internal routing key drives the metadata/fallback lookup, while the
         # public name is what the client sees as the model id.
-        model_data = []
         admin_entries: Final = TeamModelNameTranslator.listing_entries(all_models, llm_router, settings)
-        for response_id, lookup_id in admin_entries:
-            model_info = create_model_info_response(
-                model_id=lookup_id,
-                provider="openai",
-                include_metadata=include_metadata or False,
-                fallback_type=fallback_type,
-                llm_router=llm_router,
+        admin_model_data: Final[tuple[ModelInfoResponse, ...]] = tuple(
+            {
+                **create_model_info_response(
+                    model_id=lookup_id,
+                    provider="openai",
+                    include_metadata=include_metadata or False,
+                    fallback_type=fallback_type,
+                    llm_router=llm_router,
+                ),
+                "id": response_id,
+            }
+            for response_id, lookup_id in admin_entries
+        )
+        admin_listing: Final = (
+            admin_model_data
+            if only_model_access_groups
+            else _append_advertised_models_to_model_data(
+                model_data=admin_model_data,
+                general_settings=settings,
             )
-            model_info["id"] = response_id
-            model_data.append(model_info)
+        )
 
         if wants_anthropic_format:
-            admin_listing: Final = cast(Sequence[ModelInfoResponse], model_data)  # cast-ok: rows built above
             return create_anthropic_model_list_response(
                 admin_listing,
                 display_names=configured_display_names(admin_entries, llm_router),
             )
 
         return dict(
-            data=model_data,
+            data=admin_listing,
             object="list",
         )
 
@@ -10585,28 +10641,37 @@ async def model_list(
     # Surface the public team name by default; legacy internal keys via flag.
     # The internal routing key drives the metadata/fallback lookup, while the
     # public name is what the client sees as the model id.
-    model_data = []
     entries: Final = TeamModelNameTranslator.listing_entries(all_models, llm_router, settings)
-    for response_id, lookup_id in entries:
-        model_info = create_model_info_response(
-            model_id=lookup_id,
-            provider="openai",
-            include_metadata=include_metadata or False,
-            fallback_type=fallback_type,
-            llm_router=llm_router,
+    model_data: Final[tuple[ModelInfoResponse, ...]] = tuple(
+        {
+            **create_model_info_response(
+                model_id=lookup_id,
+                provider="openai",
+                include_metadata=include_metadata or False,
+                fallback_type=fallback_type,
+                llm_router=llm_router,
+            ),
+            "id": response_id,
+        }
+        for response_id, lookup_id in entries
+    )
+    listing: Final = (
+        model_data
+        if only_model_access_groups
+        else _append_advertised_models_to_model_data(
+            model_data=model_data,
+            general_settings=settings,
         )
-        model_info["id"] = response_id
-        model_data.append(model_info)
+    )
 
     if wants_anthropic_format:
-        listing: Final = cast(Sequence[ModelInfoResponse], model_data)  # cast-ok: rows built above
         return create_anthropic_model_list_response(
             listing,
             display_names=configured_display_names(entries, llm_router),
         )
 
     return dict(
-        data=model_data,
+        data=listing,
         object="list",
     )
 

@@ -1793,6 +1793,34 @@
     "default_model_placeholder": "gpt-3.5-turbo"
   },
   {
+    "provider": "META",
+    "provider_display_name": "Meta Model API",
+    "litellm_provider": "meta",
+    "credential_fields": [
+      {
+        "key": "api_base",
+        "label": "API Base",
+        "placeholder": "https://api.meta.ai/v1",
+        "tooltip": "Optional. Override the Meta Model API endpoint. Leave blank to use https://api.meta.ai/v1.",
+        "required": false,
+        "field_type": "text",
+        "options": null,
+        "default_value": null
+      },
+      {
+        "key": "api_key",
+        "label": "Meta API Key",
+        "placeholder": null,
+        "tooltip": "Meta Model API key. You can provide the raw key or an environment variable (e.g. `os.environ/META_API_KEY`).",
+        "required": false,
+        "field_type": "password",
+        "options": null,
+        "default_value": null
+      }
+    ],
+    "default_model_placeholder": "meta/muse-spark-1.1"
+  },
+  {
     "provider": "MILVUS",
     "provider_display_name": "Milvus",
     "litellm_provider": "milvus",

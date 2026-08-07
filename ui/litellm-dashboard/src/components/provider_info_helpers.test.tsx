@@ -62,6 +62,12 @@ describe("provider_info_helpers", () => {
       expect(result.logo).toBe(providerLogoMap[Providers.Groq]);
     });
 
+    it("should map meta provider value to Meta Model API display name and logo", () => {
+      const result = getProviderLogoAndName("meta");
+      expect(result.displayName).toBe(Providers.META);
+      expect(result.logo).toBe(providerLogoMap[Providers.META]);
+    });
+
     it("should map bedrock_mantle slug to Bedrock Mantle display name and logo", () => {
       const result = getProviderLogoAndName("bedrock_mantle");
       expect(result.displayName).toBe(Providers.BedrockMantle);
@@ -349,6 +355,16 @@ describe("provider_info_helpers", () => {
       expect(result).toContain("bedrock_mantle/openai.gpt-5.5");
       expect(result).not.toContain("bedrock-base");
       expect(result).not.toContain("bedrock-converse-model");
+    });
+
+    it("should return only Meta Model API models when called with 'META' provider key", () => {
+      const modelMap = {
+        "meta/muse-spark-1.1": { litellm_provider: "meta" },
+        "meta_llama/Llama-4-Scout-17B-16E-Instruct-FP8": { litellm_provider: "meta_llama" },
+        "gpt-4": { litellm_provider: "openai" },
+      };
+      const result = getProviderModels("META" as Providers, modelMap);
+      expect(result).toEqual(["meta/muse-spark-1.1"]);
     });
 
     it("should include fireworks_ai-embedding-models when called with 'FireworksAI' provider key", () => {

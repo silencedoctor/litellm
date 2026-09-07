@@ -400,7 +400,23 @@ def _stream_chunks_have_generated_content(chunks: Sequence[ModelResponseStream])
 
 
 _NO_SESSION_KWARGS: Final[Mapping[str, Mapping[str, object]]] = MappingProxyType({})
+_EMPTY_OBJECT_MAPPING: Final[Mapping[str, object]] = MappingProxyType({})
 _SESSION_ADAPTER: Final = TypeAdapter(Mapping[str, object])
+_HEADER_NAMES_ADAPTER: Final = TypeAdapter(tuple[object, ...])
+
+
+def _validated_object_mapping(value: object) -> Mapping[str, object] | None:
+    try:
+        return _SESSION_ADAPTER.validate_python(value)
+    except ValidationError:
+        return None
+
+
+def _validated_header_names(value: object) -> frozenset[str]:
+    try:
+        return frozenset(name.lower() for name in _HEADER_NAMES_ADAPTER.validate_python(value) if isinstance(name, str))
+    except ValidationError:
+        return frozenset()
 
 
 def _with_router_resolved_session_model(session: object, model_name: str) -> Mapping[str, Mapping[str, object]]:
@@ -607,6 +623,7 @@ RETRY_BREADCRUMB_EXCLUDED_KWARGS: Final = frozenset(
         "original_function",
         "attempted_targets",
         "proxy_server_request",
+        "_router_original_extra_headers",
     )
 )
 RETRY_BREADCRUMB_LIMIT: Final = 4
@@ -3478,6 +3495,7 @@ class Router:
         honour the precedence request > deployment litellm_params > litellm_settings while an
         absent num_retries still means "the caller did not ask for one".
         """
+        kwargs.pop("_router_original_extra_headers", None)
         kwargs.setdefault("litellm_trace_id", str(uuid.uuid4()))
         model_group_alias: str | None = None
         if self._get_model_from_alias(model=model):
@@ -3601,6 +3619,73 @@ class Router:
         if "tool_choice" not in kwargs and dep_params.get("tool_choice") is not None:
             kwargs["tool_choice"] = dep_params["tool_choice"]
 
+    @staticmethod
+    def _merge_forwarded_client_headers_from_deployment(
+        deployment: Mapping[str, object], kwargs: dict[str, object]
+    ) -> None:
+        dep_params_raw: Final = deployment.get("litellm_params")
+        if "_router_original_extra_headers" not in kwargs:
+            if isinstance(dep_params_raw, dict):
+                if not dep_params_raw.get("forward_client_headers"):
+                    return
+            elif isinstance(dep_params_raw, BaseModel):
+                if not getattr(dep_params_raw, "forward_client_headers", None):
+                    return
+            else:
+                return
+        dep_params: Final = _validated_object_mapping(
+            dep_params_raw.model_dump(exclude_none=True) if isinstance(dep_params_raw, BaseModel) else dep_params_raw
+        )
+        if dep_params is None:
+            return
+        allowed_header_names: Final = _validated_header_names(dep_params.get("forward_client_headers"))
+
+        original_extra_headers = _validated_object_mapping(kwargs.get("_router_original_extra_headers"))
+        if original_extra_headers is None:
+            if not allowed_header_names:
+                return
+            original_extra_headers = _validated_object_mapping(kwargs.get("extra_headers")) or _EMPTY_OBJECT_MAPPING
+            kwargs["_router_original_extra_headers"] = (
+                original_extra_headers  # rebind-ok: request state is updated in place
+            )
+
+        proxy_request: Final = _validated_object_mapping(kwargs.get("proxy_server_request"))
+        request_headers: Final = _validated_object_mapping(
+            proxy_request.get("headers") if proxy_request is not None else None
+        )
+
+        deployment_extra_headers: Final = (
+            _validated_object_mapping(dep_params.get("extra_headers")) or _EMPTY_OBJECT_MAPPING
+        )
+        original_header_names: Final = frozenset(name.lower() for name in original_extra_headers)
+        merged_extra_headers: Final = {  # mutable-ok: builds the per-attempt outbound header mapping
+            name: value
+            for name, value in (*deployment_extra_headers.items(), *original_extra_headers.items())
+            if name.lower() not in original_header_names or name in original_extra_headers
+        }
+        if not allowed_header_names or request_headers is None:
+            if merged_extra_headers:
+                kwargs["extra_headers"] = merged_extra_headers  # rebind-ok: request state is updated in place
+            else:
+                kwargs.pop("extra_headers", None)
+            return
+
+        explicit_header_names: Final = frozenset(name.lower() for name in merged_extra_headers)
+        forwarded_headers: Final = {  # mutable-ok: builds the allowlisted header mapping
+            request_header: value
+            for request_header, value in request_headers.items()
+            if isinstance(value, str)
+            and request_header.lower() in allowed_header_names
+            and request_header.lower() not in explicit_header_names
+        }
+        merged_headers: Final = {  # mutable-ok: builds the final per-attempt header mapping
+            name: value for name, value in (*merged_extra_headers.items(), *forwarded_headers.items())
+        }
+        if merged_headers:
+            kwargs["extra_headers"] = merged_headers  # rebind-ok: request state is updated in place
+        else:
+            kwargs.pop("extra_headers", None)
+
     def _update_kwargs_with_deployment(
         self,
         deployment: dict,
@@ -3618,6 +3703,7 @@ class Router:
         ):
             kwargs.pop(key, None)
         self._merge_tools_from_deployment(deployment=deployment, kwargs=kwargs)
+        self._merge_forwarded_client_headers_from_deployment(deployment=deployment, kwargs=kwargs)
 
         model_info = deployment.get("model_info", {}).copy()
         deployment_litellm_model_name = deployment["litellm_params"]["model"]

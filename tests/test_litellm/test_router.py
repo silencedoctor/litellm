@@ -5557,6 +5557,155 @@ def test_update_kwargs_with_deployment_no_tags():
     assert "tags" not in kwargs["metadata"]
 
 
+def test_update_kwargs_with_deployment_forwards_allowlisted_client_headers():
+    router = litellm.Router(model_list=[])
+    deployment = {
+        "model_name": "assistant",
+        "litellm_params": {
+            "model": "provider/model-a",
+            "forward_client_headers": ["user-agent", "traceparent"],
+        },
+        "model_info": {"id": "deployment-id"},
+    }
+    kwargs = {
+        "metadata": {},
+        "proxy_server_request": {
+            "headers": {
+                "User-Agent": "client/1.0",
+                "TraceParent": "trace-id",
+                "X-Not-Allowed": "drop-me",
+            }
+        },
+    }
+
+    router._update_kwargs_with_deployment(deployment=deployment, kwargs=kwargs)
+
+    assert kwargs["extra_headers"] == {
+        "User-Agent": "client/1.0",
+        "TraceParent": "trace-id",
+    }
+
+
+def test_update_kwargs_with_deployment_explicit_headers_win_case_insensitively():
+    router = litellm.Router(model_list=[])
+    deployment = {
+        "model_name": "assistant",
+        "litellm_params": {
+            "model": "provider/model-a",
+            "extra_headers": {
+                "X-Provider": "deployment",
+                "X-Conflict": "deployment",
+            },
+            "forward_client_headers": ["x-conflict", "x-trace"],
+        },
+        "model_info": {"id": "deployment-id"},
+    }
+    kwargs = {
+        "metadata": {},
+        "extra_headers": {"x-conflict": "request"},
+        "proxy_server_request": {
+            "headers": {
+                "X-Conflict": "client",
+                "X-Trace": "trace-id",
+            }
+        },
+    }
+
+    router._update_kwargs_with_deployment(deployment=deployment, kwargs=kwargs)
+
+    assert kwargs["extra_headers"] == {
+        "X-Provider": "deployment",
+        "x-conflict": "request",
+        "X-Trace": "trace-id",
+    }
+
+
+def test_update_kwargs_with_deployment_rebuilds_forwarded_headers_for_each_deployment():
+    router = litellm.Router(model_list=[])
+    first_deployment = {
+        "model_name": "assistant",
+        "litellm_params": {
+            "model": "provider/model-a",
+            "forward_client_headers": ["user-agent"],
+        },
+        "model_info": {"id": "deployment-a"},
+    }
+    second_deployment = {
+        "model_name": "assistant",
+        "litellm_params": {
+            "model": "provider/model-b",
+            "forward_client_headers": ["traceparent"],
+        },
+        "model_info": {"id": "deployment-b"},
+    }
+    third_deployment = {
+        "model_name": "assistant",
+        "litellm_params": {"model": "provider/model-c"},
+        "model_info": {"id": "deployment-c"},
+    }
+    kwargs = {
+        "metadata": {},
+        "proxy_server_request": {
+            "headers": {
+                "User-Agent": "client/1.0",
+                "TraceParent": "trace-id",
+            }
+        },
+    }
+
+    router._update_kwargs_with_deployment(deployment=first_deployment, kwargs=kwargs)
+    assert kwargs["extra_headers"] == {"User-Agent": "client/1.0"}
+
+    router._update_kwargs_with_deployment(deployment=second_deployment, kwargs=kwargs)
+    assert kwargs["extra_headers"] == {"TraceParent": "trace-id"}
+
+    router._update_kwargs_with_deployment(deployment=third_deployment, kwargs=kwargs)
+    assert "extra_headers" not in kwargs
+
+
+def test_update_kwargs_with_deployment_ignores_malformed_request_headers():
+    router = litellm.Router(model_list=[])
+    deployment = {
+        "model_name": "assistant",
+        "litellm_params": {
+            "model": "provider/model-a",
+            "forward_client_headers": ["user-agent"],
+        },
+        "model_info": {"id": "deployment-id"},
+    }
+    kwargs = {
+        "metadata": {},
+        "proxy_server_request": {"headers": ["not-a-header-mapping"]},
+    }
+
+    router._update_kwargs_with_deployment(deployment=deployment, kwargs=kwargs)
+
+    assert "extra_headers" not in kwargs
+
+
+def test_router_discards_caller_supplied_header_state_and_filters_internal_fields():
+    router = litellm.Router(model_list=[])
+    deployment = {
+        "model_name": "assistant",
+        "litellm_params": {"model": "provider/model-a"},
+        "model_info": {"id": "deployment-id"},
+    }
+    kwargs = {
+        "_router_original_extra_headers": {"Authorization": "injected"},
+        "metadata": {},
+    }
+
+    router._update_kwargs_before_fallbacks(model="assistant", kwargs=kwargs)
+    router._update_kwargs_with_deployment(deployment=deployment, kwargs=kwargs)
+
+    assert "_router_original_extra_headers" not in kwargs
+    assert "extra_headers" not in kwargs
+
+    from litellm.types.utils import all_litellm_params
+
+    assert {"forward_client_headers", "_router_original_extra_headers"} <= set(all_litellm_params)
+
+
 def test_update_kwargs_with_deployment_merges_tools():
     """
     Test that when both deployment litellm_params and request have tools,

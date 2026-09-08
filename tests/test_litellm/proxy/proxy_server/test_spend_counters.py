@@ -77,6 +77,24 @@ def _make_user_api_key_cache(get_value=None, get_side_effect=None):
     return cache
 
 
+def test_spend_counter_cache_retains_many_active_counters():
+    cache: Final = ps.spend_counter_cache.in_memory_cache
+    sentinel_key: Final = "spend:key:eviction-sentinel"
+    other_keys: Final = tuple(
+        f"spend:end_user:active-{index}" for index in range(1_000)
+    )
+
+    try:
+        cache.set_cache(key=sentinel_key, value=15.0)
+        for key in other_keys:
+            cache.set_cache(key=key, value=1.0)
+
+        assert cache.get_cache(key=sentinel_key) == 15.0
+    finally:
+        for key in (sentinel_key, *other_keys):
+            cache.delete_cache(key=key)
+
+
 # ---------------------------------------------------------------------------
 # get_current_spend
 # ---------------------------------------------------------------------------

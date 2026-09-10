@@ -537,8 +537,6 @@ def test_get_api_key_from_custom_header_different_casing():
     )
 
 
-
-
 @pytest.mark.parametrize(
     "user_role, auth_user_id, requested_user_id, expected_result",
     [
@@ -882,6 +880,15 @@ async def test_user_api_key_auth_websocket_carries_asgi_path():
     reconstructed from the (Host-poisonable) ``websocket.url``.
     """
     from litellm.proxy.auth.user_api_key_auth import user_api_key_auth_websocket
+    from litellm.proxy.auth.auth_utils import request_dispatched_to_pass_through_endpoint
+    from litellm.types.passthrough_endpoints.pass_through_endpoints import (
+        LITELLM_PASS_THROUGH_ENDPOINT_MARKER,
+    )
+
+    async def websocket_endpoint() -> None:
+        return None
+
+    setattr(websocket_endpoint, LITELLM_PASS_THROUGH_ENDPOINT_MARKER, True)
 
     mock_websocket = MagicMock(spec=WebSocket)
     mock_websocket.query_params = {"model": "some_model"}
@@ -890,6 +897,7 @@ async def test_user_api_key_auth_websocket_carries_asgi_path():
         "type": "websocket",
         "path": "/v1/realtime",
         "root_path": "",
+        "endpoint": websocket_endpoint,
         "headers": [(b"authorization", b"Bearer some_api_key")],
     }
     mock_websocket.url = URL(url="/v1/realtime")
@@ -900,6 +908,9 @@ async def test_user_api_key_auth_websocket_carries_asgi_path():
         request_arg = mock_user_api_key_auth.call_args.kwargs["request"]
         assert request_arg.scope.get("path") == "/v1/realtime"
         assert request_arg.scope.get("root_path") == ""
+        assert request_arg.scope.get("endpoint") is mock_websocket.scope["endpoint"]
+        assert request_arg.method == "WEBSOCKET"
+        assert request_dispatched_to_pass_through_endpoint(request_arg) is True
 
 
 @pytest.mark.parametrize("enforce_rbac", [True, False])

@@ -539,9 +539,10 @@ async def user_api_key_auth_websocket(websocket: WebSocket):
     synthetic_scope: Final[dict[str, Any]] = {
         "type": "http",
         "headers": scope_headers,
+        "method": "WEBSOCKET",
         "path": ws_scope.get("path", ""),
     }
-    for key in ("root_path", "app_root_path"):
+    for key in ("root_path", "app_root_path", "endpoint"):
         if key in ws_scope:
             synthetic_scope[key] = ws_scope[key]
     request: Final = Request(scope=synthetic_scope)

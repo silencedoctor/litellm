@@ -11,38 +11,228 @@ from unittest.mock import AsyncMock, MagicMock, patch
 
 import httpx
 import pytest
-from fastapi import Request, Response, UploadFile
+from fastapi import FastAPI, Request, Response, UploadFile
+from fastapi.routing import APIWebSocketRoute
+from pydantic import ValidationError
 from starlette.datastructures import FormData, Headers, QueryParams
 from starlette.datastructures import UploadFile as StarletteUploadFile
 
-
+import litellm
+from litellm.integrations.custom_logger import CustomLogger
+from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
+from litellm.proxy._types import ProxyException, UserAPIKeyAuth
 from litellm.proxy.pass_through_endpoints.pass_through_endpoints import (
     DEFAULT_PASS_THROUGH_REQUEST_TIMEOUT_SECONDS,
+    LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY,
     HttpPassThroughEndpointHelpers,
     InitPassThroughEndpointHelpers,
-    LITELLM_PASS_THROUGH_CUSTOM_BODY_STATE_KEY,
+    SafeRouteAdder,
+    _register_pass_through_endpoint,
     _registered_pass_through_routes,
     chat_completion_pass_through_endpoint,
     create_pass_through_route,
     initialize_pass_through_endpoints,
     pass_through_request,
-    resolve_pass_through_request_timeout,
     resolve_llm_passthrough_timeout,
+    resolve_pass_through_request_timeout,
     websocket_passthrough_request,
-)
-from litellm.integrations.custom_logger import CustomLogger
-from litellm.litellm_core_utils.litellm_logging import Logging as LiteLLMLoggingObj
-from litellm.proxy._types import ProxyException, UserAPIKeyAuth
-from litellm.types.passthrough_endpoints.pass_through_endpoints import (
-    LITELLM_PASS_THROUGH_RAW_BODY_STATE_KEY,
 )
 from litellm.proxy.pass_through_endpoints.success_handler import (
     PassThroughEndpointLogging,
 )
-
-import litellm
+from litellm.types.passthrough_endpoints.pass_through_endpoints import (
+    LITELLM_PASS_THROUGH_ENDPOINT_MARKER,
+    LITELLM_PASS_THROUGH_RAW_BODY_STATE_KEY,
+)
 
 MESSAGE_START_SSE_FRAME = b'event: message_start\ndata: {"type": "message_start"}\n\n'
+
+
+class TestConfigurableWebSocketPassThrough:
+    def setup_method(self) -> None:
+        _registered_pass_through_routes.clear()
+
+    def teardown_method(self) -> None:
+        _registered_pass_through_routes.clear()
+        from litellm.proxy._types import LiteLLMRoutes
+
+        if "/ws/provider" in LiteLLMRoutes.openai_routes.value:
+            LiteLLMRoutes.openai_routes.value.remove("/ws/provider")
+
+    @pytest.mark.parametrize("target", ["ws://stream.example.invalid/session", "wss://stream.example.invalid/session"])
+    def test_websocket_endpoint_accepts_websocket_targets(self, target: str) -> None:
+        from litellm.proxy._types import PassThroughGenericEndpoint
+
+        endpoint = PassThroughGenericEndpoint(
+            path="/ws/provider",
+            target=target,
+            protocol="websocket",
+        )
+
+        assert endpoint.protocol == "websocket"
+
+    @pytest.mark.parametrize(
+        ("options", "error"),
+        [
+            ({"target": "https://stream.example.invalid/session"}, "ws:// or wss://"),
+            ({"auth": False}, "auth=true"),
+            ({"include_subpath": True}, "include_subpath"),
+            ({"methods": ["GET"]}, "methods"),
+            ({"default_query_params": {"version": "1"}}, "default_query_params"),
+            ({"guardrails": {"redact": None}}, "guardrails"),
+            ({"timeout": 30}, "timeout"),
+        ],
+    )
+    def test_websocket_endpoint_rejects_unsupported_options(self, options: dict[str, object], error: str) -> None:
+        from litellm.proxy._types import PassThroughGenericEndpoint
+
+        endpoint_data: dict[str, object] = {
+            "path": "/ws/provider",
+            "target": "wss://stream.example.invalid/session",
+            "protocol": "websocket",
+            **options,
+        }
+        with pytest.raises(ValidationError, match=error):
+            PassThroughGenericEndpoint.model_validate(endpoint_data)
+
+    @pytest.mark.asyncio
+    async def test_websocket_endpoint_registers_authenticated_route_and_uses_latest_config(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        from litellm.proxy.auth.user_api_key_auth import user_api_key_auth_websocket
+        from litellm.proxy.auth.route_checks import RouteChecks
+
+        monkeypatch.setenv("UPSTREAM_API_KEY", "upstream-secret")
+        app = FastAPI()
+        visited_endpoints: set[str] = set()
+
+        await _register_pass_through_endpoint(
+            endpoint={
+                "id": "websocket-endpoint",
+                "path": "/ws/provider",
+                "target": "wss://stream.example.invalid/first",
+                "protocol": "websocket",
+                "headers": {"Authorization": "Bearer os.environ/UPSTREAM_API_KEY"},
+            },
+            app=app,
+            premium_user=False,
+            visited_endpoints=visited_endpoints,
+        )
+        await _register_pass_through_endpoint(
+            endpoint={
+                "id": "websocket-endpoint",
+                "path": "/ws/provider",
+                "target": "ws://stream.example.invalid/current",
+                "protocol": "websocket",
+                "headers": {"X-Upstream-Token": "os.environ/UPSTREAM_API_KEY"},
+            },
+            app=app,
+            premium_user=False,
+            visited_endpoints=visited_endpoints,
+        )
+
+        route = SafeRouteAdder.get_websocket_route(app=app, path="/ws/provider")
+        assert isinstance(route, APIWebSocketRoute)
+        assert len([candidate for candidate in app.routes if candidate.path == "/ws/provider"]) == 1
+        assert route.dependant.dependencies[0].call is user_api_key_auth_websocket
+        assert getattr(route.endpoint, LITELLM_PASS_THROUGH_ENDPOINT_MARKER, False) is True
+        assert "websocket-endpoint:websocket:/ws/provider" in visited_endpoints
+        assert RouteChecks.is_auth_enforced_pass_through_route("/ws/provider", "WEBSOCKET") is True
+
+        websocket = MagicMock()
+        websocket.scope = {"path": "/ws/provider"}
+        websocket.headers = {"authorization": "Bearer client-credential"}
+        user_api_key = UserAPIKeyAuth()
+        with patch(  # test-quality-ok: isolate the existing relay to assert registered route configuration
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.websocket_passthrough_request",
+            new_callable=AsyncMock,
+        ) as mock_relay:
+            await route.endpoint(websocket=websocket, user_api_key_dict=user_api_key)
+
+        mock_relay.assert_awaited_once_with(
+            websocket=websocket,
+            target="ws://stream.example.invalid/current",
+            custom_headers={"X-Upstream-Token": "upstream-secret"},
+            user_api_key_dict=user_api_key,
+            forward_headers=False,
+            endpoint="/ws/provider",
+            cost_per_request=0.0,
+            accept_websocket=True,
+        )
+        assert InitPassThroughEndpointHelpers.get_registered_pass_through_route("/ws/provider", "WEBSOCKET") is not None
+        assert InitPassThroughEndpointHelpers.get_registered_pass_through_route("/ws/provider", "GET") is None
+
+    def test_websocket_endpoint_does_not_replace_builtin_route(self) -> None:
+        app = FastAPI()
+
+        @app.websocket("/ws/provider")
+        async def builtin_route() -> None:
+            return None
+
+        was_registered = InitPassThroughEndpointHelpers.add_websocket_route(
+            app=app,
+            path="/ws/provider",
+            target="wss://stream.example.invalid/session",
+            custom_headers={},
+            cost_per_request=0.0,
+            endpoint_id="websocket-endpoint",
+            auth=True,
+        )
+
+        route = SafeRouteAdder.get_websocket_route(app=app, path="/ws/provider")
+        assert was_registered is False
+        assert route is not None and route.endpoint is builtin_route
+        assert InitPassThroughEndpointHelpers.get_registered_pass_through_route("/ws/provider", "WEBSOCKET") is None
+
+    @pytest.mark.asyncio
+    async def test_removed_websocket_endpoint_rejects_new_connections(self) -> None:
+        app = FastAPI()
+        InitPassThroughEndpointHelpers.add_websocket_route(
+            app=app,
+            path="/ws/provider",
+            target="wss://stream.example.invalid/session",
+            custom_headers={},
+            cost_per_request=0.0,
+            endpoint_id="websocket-endpoint",
+            auth=True,
+        )
+        route = SafeRouteAdder.get_websocket_route(app=app, path="/ws/provider")
+        assert route is not None
+        _registered_pass_through_routes.clear()
+
+        websocket = MagicMock()
+        websocket.scope = {"path": "/ws/provider"}
+        websocket.close = AsyncMock()
+        with patch(  # test-quality-ok: isolate the existing relay to assert deleted routes cannot forward
+            "litellm.proxy.pass_through_endpoints.pass_through_endpoints.websocket_passthrough_request",
+            new_callable=AsyncMock,
+        ) as mock_relay:
+            await route.endpoint(websocket=websocket, user_api_key_dict=UserAPIKeyAuth())
+
+        websocket.close.assert_awaited_once_with(code=1008)
+        mock_relay.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_websocket_endpoint_rejects_http_only_raw_options(self) -> None:
+        with pytest.raises(ValueError, match="forward_headers"):
+            await _register_pass_through_endpoint(
+                endpoint={
+                    "path": "/ws/provider",
+                    "target": "wss://stream.example.invalid/session",
+                    "protocol": "websocket",
+                    "forward_headers": True,
+                },
+                app=FastAPI(),
+                premium_user=False,
+                visited_endpoints=set(),
+            )
+
+    def test_http_endpoint_remains_the_default(self) -> None:
+        from litellm.proxy._types import PassThroughGenericEndpoint
+
+        endpoint = PassThroughGenericEndpoint(path="/http/provider", target="https://api.example.invalid/v1")
+
+        assert endpoint.protocol == "http"
 
 
 # Test is_multipart

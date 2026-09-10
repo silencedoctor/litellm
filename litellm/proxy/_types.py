@@ -5,6 +5,7 @@ from collections.abc import Callable, Mapping
 from datetime import datetime
 from types import MappingProxyType
 from typing import TYPE_CHECKING, Any, Final, Literal, NamedTuple
+from urllib.parse import urlparse
 
 import httpx
 from pydantic import (
@@ -2288,6 +2289,10 @@ class PassThroughGenericEndpoint(LiteLLMPydanticObjectBase):
     )
     path: str = Field(description="The route to be added to the LiteLLM Proxy Server.")
     target: str = Field(description="The URL to which requests for this path should be forwarded.")
+    protocol: Literal["http", "websocket"] = Field(
+        default="http",
+        description="Protocol used by the pass-through endpoint.",
+    )
     headers: dict = Field(
         default={},
         description="Key-value pairs of headers to be forwarded with the request. You can set any key value pair here and it will be forwarded to your target endpoint",
@@ -2324,6 +2329,28 @@ class PassThroughGenericEndpoint(LiteLLMPydanticObjectBase):
         default=None,
         description="List of HTTP methods this endpoint handles (e.g., ['GET', 'POST']). If None or empty, all methods (GET, POST, PUT, DELETE, PATCH) are supported for backward compatibility. This allows the same path to have different targets for different HTTP methods.",
     )
+
+    @model_validator(mode="after")
+    def validate_websocket_options(self) -> "PassThroughGenericEndpoint":
+        if self.protocol == "http":
+            return self
+
+        parsed_target: Final = urlparse(self.target)
+        if parsed_target.scheme not in {"ws", "wss"} or not parsed_target.netloc:
+            raise ValueError("websocket pass-through target must use a valid ws:// or wss:// URL")
+        if self.auth is not True:
+            raise ValueError("websocket pass-through endpoints require auth=true")
+        if self.include_subpath:
+            raise ValueError("include_subpath is not supported for websocket pass-through endpoints")
+        if self.methods:
+            raise ValueError("methods is not supported for websocket pass-through endpoints")
+        if self.default_query_params:
+            raise ValueError("default_query_params is not supported for websocket pass-through endpoints")
+        if self.guardrails is not None:
+            raise ValueError("guardrails are not supported for websocket pass-through endpoints")
+        if self.timeout is not None:
+            raise ValueError("timeout is not supported for websocket pass-through endpoints")
+        return self
 
 
 class PassThroughEndpointResponse(LiteLLMPydanticObjectBase):

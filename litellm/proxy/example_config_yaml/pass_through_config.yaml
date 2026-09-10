@@ -37,6 +37,12 @@ general_settings:
       include_subpath: true
       headers:
         Authorization: os.environ/AZURE_API_KEY
+    - path: /ws/provider
+      target: wss://stream.example.invalid/v1/session
+      protocol: websocket
+      auth: true
+      headers:
+        Authorization: Bearer os.environ/UPSTREAM_API_KEY
 
 litellm_settings:
   include_cost_in_streaming_usage: true

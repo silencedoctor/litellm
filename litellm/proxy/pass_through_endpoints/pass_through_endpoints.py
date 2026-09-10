@@ -25,6 +25,7 @@ from fastapi import (
     status,
 )
 from fastapi.responses import StreamingResponse
+from fastapi.routing import APIWebSocketRoute
 from starlette.datastructures import UploadFile as StarletteUploadFile
 from starlette.websockets import WebSocketState
 from websockets.asyncio.client import connect
@@ -119,6 +120,7 @@ pass_through_endpoint_logging: Final = PassThroughEndpointLogging()
 
 # Global registry to track registered pass-through routes and prevent memory leaks
 _registered_pass_through_routes: Final[dict[str, dict[str, str | bool | list[str] | Mapping[str, object]]]] = {}
+_CONFIGURABLE_WEBSOCKET_PASS_THROUGH_MARKER: Final = "__litellm_configurable_websocket_passthrough__"
 
 
 def get_response_body(response: httpx.Response) -> dict | None:
@@ -2052,14 +2054,40 @@ def create_websocket_passthrough_route(
         3. Forwarding messages bidirectionally
         4. Handling connection cleanup
         """
+        is_configurable: Final = (
+            getattr(
+                websocket_endpoint_func,
+                _CONFIGURABLE_WEBSOCKET_PASS_THROUGH_MARKER,
+                False,
+            )
+            is True
+        )
+        scope_path: Final = websocket.scope.get("path")
+        path: Final[str] = scope_path if isinstance(scope_path, str) else endpoint
+        registered_route: Final = (
+            InitPassThroughEndpointHelpers.get_registered_pass_through_route(path, method="WEBSOCKET")
+            if is_configurable
+            else None
+        )
+        registered_params: Final = registered_route.get("passthrough_params", {}) if registered_route else {}
+        registered_target: Final = registered_params.get("target", target)
+        registered_headers: Final = registered_params.get("custom_headers", custom_headers)
+        registered_cost: Final = registered_params.get("cost_per_request", cost_per_request)
+
+        if registered_route is None and is_configurable:
+            await websocket.close(code=status.WS_1008_POLICY_VIOLATION)
+            return None
+
+        resolved_target: Final = registered_target if isinstance(registered_target, str) else target
+        resolved_cost: Final = registered_cost if isinstance(registered_cost, (int, float)) else cost_per_request
         return await websocket_passthrough_request(
             websocket=websocket,
-            target=target,
-            custom_headers=custom_headers or {},
+            target=resolved_target,
+            custom_headers=dict(registered_headers) if isinstance(registered_headers, Mapping) else {},
             user_api_key_dict=user_api_key_dict,
             forward_headers=_forward_headers,
             endpoint=endpoint,
-            cost_per_request=cost_per_request,
+            cost_per_request=resolved_cost,
             accept_websocket=True,  # Generic usage should accept the WebSocket
         )
 
@@ -2796,8 +2824,97 @@ class SafeRouteAdder:
         )
         return True
 
+    @staticmethod
+    def get_websocket_route(app: FastAPI, path: str) -> APIWebSocketRoute | None:
+        return next(
+            (route for route in app.routes if isinstance(route, APIWebSocketRoute) and route.path == path),
+            None,
+        )
+
+    @staticmethod
+    def add_api_websocket_route_if_not_exists(
+        app: FastAPI,
+        path: str,
+        endpoint: Callable[..., object],
+    ) -> bool:
+        if SafeRouteAdder.get_websocket_route(app=app, path=path) is not None:
+            verbose_proxy_logger.debug(
+                "Skipping WebSocket route registration because path %s is already registered", path
+            )
+            return False
+
+        app.add_api_websocket_route(path=path, endpoint=endpoint)
+        verbose_proxy_logger.debug("Successfully added WebSocket route: %s", path)
+        return True
+
 
 class InitPassThroughEndpointHelpers:
+    @staticmethod
+    def add_websocket_route(
+        app: FastAPI,
+        path: str,
+        target: str,
+        custom_headers: dict | None,
+        cost_per_request: float | None,
+        endpoint_id: str,
+        auth: bool,
+    ) -> bool:
+        route_key: Final = f"{endpoint_id}:websocket:{path}"
+        existing_route: Final = SafeRouteAdder.get_websocket_route(app=app, path=path)
+        existing_route_is_configurable: Final = (
+            existing_route is not None
+            and getattr(
+                existing_route.endpoint,
+                _CONFIGURABLE_WEBSOCKET_PASS_THROUGH_MARKER,
+                False,
+            )
+            is True
+        )
+
+        if existing_route is not None and not existing_route_is_configurable:
+            verbose_proxy_logger.warning(
+                "Skipping configurable WebSocket pass-through route %s because the path is already registered",
+                path,
+            )
+            return False
+
+        if existing_route is None:
+            endpoint_func: Final = create_websocket_passthrough_route(
+                endpoint=path,
+                target=target,
+                custom_headers=custom_headers,
+                _forward_headers=False,
+                cost_per_request=cost_per_request,
+            )
+            setattr(endpoint_func, _CONFIGURABLE_WEBSOCKET_PASS_THROUGH_MARKER, True)
+            setattr(endpoint_func, LITELLM_PASS_THROUGH_ENDPOINT_MARKER, True)
+            SafeRouteAdder.add_api_websocket_route_if_not_exists(app=app, path=path, endpoint=endpoint_func)
+
+        stale_route_keys: Final = tuple(
+            key
+            for key, route_info in _registered_pass_through_routes.items()
+            if route_info.get("type") == "websocket" and route_info.get("path") == path and key != route_key
+        )
+        for stale_route_key in stale_route_keys:
+            _registered_pass_through_routes.pop(stale_route_key, None)
+
+        _registered_pass_through_routes[route_key] = {
+            "endpoint_id": endpoint_id,
+            "path": path,
+            "type": "websocket",
+            "methods": ["WEBSOCKET"],
+            "auth": auth,
+            "passthrough_params": {
+                "target": target,
+                "custom_headers": custom_headers,
+                "forward_headers": False,
+                "cost_per_request": cost_per_request,
+            },
+        }
+        if auth and path not in LiteLLMRoutes.openai_routes.value:
+            LiteLLMRoutes.openai_routes.value.append(path)
+        return True
+
     @staticmethod
     def add_exact_path_route(
         app: FastAPI,
@@ -3040,7 +3157,7 @@ class InitPassThroughEndpointHelpers:
             if len(parts) >= 3:
                 route_type = parts[1]
                 registered_path = parts[2]
-                if route_type == "exact" and comparison_route == registered_path:
+                if route_type in {"exact", "websocket"} and comparison_route == registered_path:
                     return True
                 elif route_type == "subpath":
                     if comparison_route == registered_path or comparison_route.startswith(registered_path + "/"):
@@ -3068,7 +3185,7 @@ class InitPassThroughEndpointHelpers:
 
                 # Check if path matches
                 path_matches = False
-                if route_type == "exact" and comparison_route == registered_path:
+                if route_type in {"exact", "websocket"} and comparison_route == registered_path:
                     path_matches = True
                 elif route_type == "subpath":
                     if comparison_route == registered_path or comparison_route.startswith(registered_path + "/"):
@@ -3090,6 +3207,24 @@ def _get_combined_pass_through_endpoints(
     return pass_through_endpoints + config_pass_through_endpoints
 
 
+def _resolve_pass_through_protocol(endpoint_data: Mapping[str, object]) -> str:
+    raw_protocol: Final = endpoint_data.get("protocol", "http")
+    if raw_protocol == "http":
+        return "http"
+    if raw_protocol != "websocket":
+        raise ValueError("pass-through endpoint protocol must be 'http' or 'websocket'")
+
+    unsupported_options: Final = ("forward_headers", "merge_query_params", "custom_auth_parser")
+    configured_unsupported_options: Final = tuple(
+        option
+        for option in unsupported_options
+        if endpoint_data.get(option) is not None and endpoint_data.get(option) is not False
+    )
+    if configured_unsupported_options:
+        raise ValueError("websocket pass-through endpoints do not support " + ", ".join(configured_unsupported_options))
+    return "websocket"
+
+
 async def _register_pass_through_endpoint(
     endpoint: dict[str, object] | PassThroughGenericEndpoint,
     app: FastAPI,
@@ -3097,11 +3232,18 @@ async def _register_pass_through_endpoint(
     visited_endpoints: set[str],
     config_file_path: str | None = None,
 ) -> None:
-    endpoint_data: dict[str, Any]
+    raw_endpoint_data: dict[str, Any]
     if isinstance(endpoint, PassThroughGenericEndpoint):
-        endpoint_data = endpoint.model_dump()
+        raw_endpoint_data = endpoint.model_dump()
     else:
-        endpoint_data = endpoint
+        raw_endpoint_data = endpoint
+
+    protocol: Final = _resolve_pass_through_protocol(raw_endpoint_data)
+    endpoint_data: Final = (
+        PassThroughGenericEndpoint.model_validate(raw_endpoint_data).model_dump()
+        if protocol == "websocket"
+        else raw_endpoint_data
+    )
 
     if endpoint_data.get("id") is None:
         endpoint_data["id"] = str(uuid.uuid4())
@@ -3126,7 +3268,7 @@ async def _register_pass_through_endpoint(
         # unless the operator had a license. The safe option must always be free,
         # and unauthenticated forwarding should require explicit opt-in.
         dependencies = [Depends(user_api_key_auth)]
-        if path not in LiteLLMRoutes.openai_routes.value:
+        if protocol == "http" and path not in LiteLLMRoutes.openai_routes.value:
             LiteLLMRoutes.openai_routes.value.append(path)
 
     if target is None:
@@ -3138,6 +3280,20 @@ async def _register_pass_through_endpoint(
     timeout: Final = endpoint_data.get("timeout")
 
     verbose_proxy_logger.debug("Initializing pass through endpoint: %s (ID: %s)", path, endpoint_id)
+    if protocol == "websocket":
+        was_registered: Final = InitPassThroughEndpointHelpers.add_websocket_route(
+            app=app,
+            path=path,
+            target=target,
+            custom_headers=custom_headers,
+            cost_per_request=cost_per_request,
+            endpoint_id=endpoint_id,
+            auth=auth_enforced,
+        )
+        if was_registered:
+            visited_endpoints.add(f"{endpoint_id}:websocket:{path}")
+        return
+
     InitPassThroughEndpointHelpers.add_exact_path_route(
         app=app,
         path=path,
@@ -3550,7 +3706,17 @@ async def update_pass_through_endpoints(
     _custom_headers = await set_env_variables_in_header(custom_headers=_custom_headers)
 
     route_app: Final = _request_app(request)
-    if updated_endpoint.include_subpath:
+    if updated_endpoint.protocol == "websocket":
+        InitPassThroughEndpointHelpers.add_websocket_route(
+            app=route_app,
+            path=updated_endpoint.path,
+            target=updated_endpoint.target,
+            custom_headers=_custom_headers,
+            cost_per_request=updated_endpoint.cost_per_request,
+            endpoint_id=updated_endpoint.id or endpoint_id,
+            auth=updated_endpoint.auth,
+        )
+    elif updated_endpoint.include_subpath:
         InitPassThroughEndpointHelpers.add_subpath_route(
             app=route_app,
             path=updated_endpoint.path,
@@ -3642,7 +3808,17 @@ async def create_pass_through_endpoints(
     _custom_headers = await set_env_variables_in_header(custom_headers=_custom_headers)
 
     route_app: Final = _request_app(request)
-    if created_endpoint.include_subpath:
+    if created_endpoint.protocol == "websocket":
+        InitPassThroughEndpointHelpers.add_websocket_route(
+            app=route_app,
+            path=created_endpoint.path,
+            target=created_endpoint.target,
+            custom_headers=_custom_headers,
+            cost_per_request=created_endpoint.cost_per_request,
+            endpoint_id=created_endpoint.id or "",
+            auth=created_endpoint.auth,
+        )
+    elif created_endpoint.include_subpath:
         InitPassThroughEndpointHelpers.add_subpath_route(
             app=route_app,
             path=created_endpoint.path,

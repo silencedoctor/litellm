@@ -6,6 +6,7 @@ import unittest
 from typing import Any
 from unittest.mock import AsyncMock, MagicMock, patch
 
+import fastapi
 import pytest
 from fastapi.testclient import TestClient
 from httpx import Response
@@ -341,6 +342,22 @@ class TestWSSessionCostTracking:
             start_time=None,
             end_time=None,
         )
+
+
+class TestResponsesWebSocketEnvironmentGate:
+    @pytest.mark.parametrize("path", ("/v1/responses", "/responses"))
+    def test_disabled_rejects_websocket_routes(self, path: str):
+        from starlette.websockets import WebSocketDisconnect
+
+        with (
+            patch.dict("os.environ", {"LITELLM_DISABLE_RESPONSES_WEBSOCKET": "true"}),
+            pytest.raises(WebSocketDisconnect) as exc_info,
+            TestClient(app).websocket_connect(path),
+        ):
+            pass
+
+        assert exc_info.value.code == fastapi.status.WS_1008_POLICY_VIOLATION
+        assert exc_info.value.reason == "Responses WebSocket is disabled"
 
 
 class TestWSModelExtraction:
